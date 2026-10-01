@@ -9,6 +9,8 @@
 - 产出继承投入的过敏原/待确认状态，并继承**设备上一次加工的残留**；
   只有两次加工之间**已验证且未撤销**的清洗才清除残留；
 - 查询任一批次，返回**每项过敏原与待确认状态的来源路径**及当前有效依据；
+  过敏原按并码关系以**最终规范代码**合并同义项并去重，`allergen_origins`
+  保留每条原始来源的声明原代码与声明版本（详见“过敏原代码并码”）；
 - 原料声明更正、清洗撤销正式落库前可先**预演（不落库）**：返回确有差异的下游
   批次（过敏原、待确认状态、来源路径及依据的前后变化，设备残留传播同样计入）、
   这些批次**已签发标签**相对变更前后实时结论的差异，以及一次性提交凭据；
@@ -28,6 +30,15 @@
   作为新加工投入**；若设备残留会使新加工产出受封存影响，加工登记同样拒绝，失败不留
   加工或标签。投入纠正、清洗登记/撤销、调查登记/解除后同步重算封存状态，
   并沿用游标事件流发布实际变化；旧标签快照不变，既有溯源结论字段保持兼容。
+- **过敏原代码并码（质控）**：质控凭**声明中出现的旧过敏原代码、目标规范代码和必填
+  原因**登记并码；目标须非空且**当前不是别名**，自映射、成环或把同一旧代码改指其他
+  目标一律**拒绝且不留记录**，同向重试返回原结果。并码可**串接**（a→b 后再 b→c），
+  查询代码返回**最终规范代码及沿革**。**原料声明版本与已签发标签快照保留原值**；
+  实时溯源按最终代码**合并同义项并去重**，同时保留每条原始来源路径、声明版本与
+  声明原代码，待确认状态不受影响。并码后重算受影响批次（含设备残留下游），沿用现有
+  事件字段与全局顺序，只为实际变化记录事件；并码与事件同事务，与并发声明更正以预演
+  凭据互斥（不得出现混合状态）。新原料登记、声明更正与预演均按当前并码关系解释代码，
+  既有接口字段与路径结构保持兼容。
 
 ## 快速启动
 
@@ -104,6 +115,9 @@ pytest tests/ -q
 | POST | `/investigations` | 登记疑似交叉接触调查封存（批次号 + 唯一调查号 + 原因） |
 | GET | `/investigations` / `/investigations/{id}` | 查询调查（可按 `?status=open/lifted` 过滤）及受影响批次/路径 |
 | POST | `/investigations/{id}/lift` | 解除调查封存（仅移除该调查自身的影响；重复解除报错） |
+| POST | `/allergen-codes/merges` | 登记过敏原代码并码（旧代码 → 规范代码，必填原因） |
+| GET | `/allergen-codes/merges` / `/allergen-codes/merges/{old_code}` | 查询并码登记（含最终规范代码与沿革） |
+| GET | `/allergen-codes/{code}/resolve` | 查询代码：最终规范代码、是否别名、并码沿革 |
 | POST | `/batches/{batch_id}/labels` | 签发标签（封存批次拒绝；可带 `supersedes_id` 关联旧版） |
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
 | GET | `/changes/snapshot` | 初始化读取：同一状态下的现存批次实时结论 + 游标 |
@@ -113,8 +127,10 @@ pytest tests/ -q
 登记调查时批次未知、非法 `status` 过滤）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
 重复调查号、重复解除、对封存批次签发标签或以封存批次/受封存残留登记新加工、
+并码目标为别名/旧代码改指其他目标/并码成环、
 预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演）；
-`422` 请求格式错误（如时间缺少时区、调查字段为空白）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
+`400` 自映射并码等无效参数；
+`422` 请求格式错误（如时间缺少时区、调查字段为空白、并码原因缺失）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
 
 ## 变更预演（dry-run）与凭据提交
 
@@ -236,7 +252,9 @@ curl -s $BASE/batches/OUT-OAT-1/trace
   `processing_register`（加工登记）、`processing_input_correction`（加工投入纠正，
   `op_ref` 为 `{"processing_id": ...}`）、`cleaning_register`（清洗登记）、
   `cleaning_revocation`（清洗撤销，含预演提交）、`investigation_open`
-  （调查封存登记）、`investigation_lift`（调查封存解除）。
+  （调查封存登记）、`investigation_lift`（调查封存解除）、`allergen_code_merge`
+  （过敏原代码并码，`op_ref` 为 `{"old_code", "target_code", "reason"}`，
+  结论以最终规范代码给出，`before/after` 含 `allergen_origins` 原始来源归集）。
   封存类事件的视图在既有 `conclusion`/`basis` 外新增 `release` 字段
   （`held` + 生效调查及传播路径）；旧字段结构不变，事件重放与快照保持兼容。
 - **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
@@ -396,17 +414,99 @@ curl -i -s $BASE/batches/OUT-OAT-1/labels -X POST -H 'Content-Type: application/
 curl -s $BASE/investigations/INV-2026-001/lift -X POST
 ```
 
+## 过敏原代码并码（质控）
+
+质控把声明中出现的**旧过敏原代码**并到**目标规范代码**（必填原因），统一同义/更名
+代码：
+
+```
+POST /allergen-codes/merges
+{"old_code": "casein", "target_code": "milk", "reason": "casein 为牛奶蛋白，按 milk 统一"}
+```
+
+登记规则（校验与写入同一 `BEGIN IMMEDIATE` 事务，失败回滚不留记录、不产事件）：
+
+- `old_code` / `target_code` / `reason` 均须非空白（空白 `422`）；
+- **自映射**（old = target）`400` 拒绝；
+- 登记时 **target 必须当前不是别名**（不得是任一登记的 `old_code`），否则 `409`；
+  并码只能**串接**不能成环：先 `casein -> milk`，随后可再 `milk -> dairy`；
+- 同一 `old_code` 一经登记**不可改指**其他目标（`409`，原记录保持）；
+  **同向重试**（old/target 完全相同）幂等返回原记录（原时间戳、原因），
+  不新增记录、不产事件；
+- 成环（目标沿并码链回到旧代码）`409`（目标当前非别名时该情形不可达，作防御拒绝）。
+
+查询代码（串接时返回**最终规范代码与沿革**）：
+
+```bash
+# 单条并码登记
+curl -s $BASE/allergen-codes/merges/casein
+# 代码解析：出现在任一原料声明版本或并码关系中即视为已知，否则 404
+curl -s $BASE/allergen-codes/casein/resolve
+# -> {"code":"casein","canonical_code":"dairy","is_alias":true,
+#     "history":[{"old_code":"casein","target_code":"milk",...},
+#                {"old_code":"milk","target_code":"dairy",...}]}
+curl -s $BASE/allergen-codes/merges          # 全部并码登记
+```
+
+实时溯源与历史保留：
+
+- **原料声明版本保留原始代码**：`GET /materials/{id}` 的 `allergens`、溯源 `basis`
+  中命中的声明版本、声明更正/预演的变更内容都不因并码改写；原料响应新增
+  `canonical_allergens`（按当前并码关系解释，纯新增字段）。
+- **已签发标签快照保留原值**：标签在签发时刻冻结结论与依据，结构与代码均不随后续
+  并码改变；并码后新签发的标签按签发时刻的规范代码冻结。
+- **实时溯源按最终规范代码合并同义项并去重**：`GET /batches/{id}/trace` 与
+  `/changes/snapshot`、变更事件的 `allergens` / `allergen_paths` 以最终规范代码为键，
+  同一路径（多重集合）只保留一条；新增 `allergen_origins` 为每个规范代码保留
+  **每条原始来源**：`declared_code`（声明原代码）、`batch_id`、
+  `declaration_version`（声明版本）与该来源各自的路径。
+  加工投入链与**同设备残留下游**同样按最终代码合并（残留来源也保留在 origins 中）。
+- **待确认状态不变**：并码只作用于过敏原代码，不改变 `pending` / `pending_paths`。
+
+```jsonc
+// GET /batches/OUT-2/trace（casein、milk 已并至 dairy，并含残留下游）
+{
+  "allergens": ["dairy", "gluten"],
+  "allergen_paths": {"dairy": [ /* 去重后的全部原始路径 */ ], ...},
+  "allergen_origins": {"dairy": [
+    {"declared_code": "casein", "batch_id": "RM-A",
+     "declaration_version": 1, "paths": [ /* 该来源各路径 */ ]},
+    {"declared_code": "milk",   "batch_id": "RM-B",
+     "declaration_version": 2, "paths": [ /* 含 equipment_residue 路径 */ ]}
+  ]},
+  "basis": {"material_declarations": [ /* 仍保留 casein/milk 原始声明值 */ ]}
+}
+```
+
+重算、事件与并发：
+
+- 并码后在同一事务内按当前并码关系重算**全部批次**实时结论（含沿同设备后续加工的
+  残留传播），沿用既有变更事件：`op` = `allergen_code_merge`，
+  `op_ref` = `{"old_code", "target_code", "reason"}`，**仅结论实际变化**的批次按
+  批次号顺序落事件（固定上界分页等约定不变）；失败/同向重试不产事件。
+- **新原料登记、声明更正与其预演均按当前并码关系解释代码**：声明可继续提交旧/别名
+  代码（原值照旧落版本），实时结论归并到当前规范代码。
+- **并码与并发声明更正不得出现混合状态**：预演指纹整表纳入并码关系，预演后发生并码
+  提交会使旧凭据失效，提交返回 `409`（需重新预演）；反过来，并码登记自身在单个
+  `BEGIN IMMEDIATE` 事务内完成“校验 + 并码写入 + 事件”，原子可见。
+- 既有接口字段与路径结构保持兼容：`allergen_origins` / `canonical_allergens` 为
+  纯新增字段，标签快照结构（仅 `conclusion`/`basis`）与事件重放语义不变。
+
+完整 curl 演示：`./examples/demo_code_merges.sh`
+
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、调查封存传播、标签签发、变更预演、变更事件流
+  service.py   # 业务规则：校验、溯源计算、调查封存传播、标签签发、变更预演、变更事件流、过敏原代码并码
   db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
 tests/test_app.py            # 45 个端到端测试（溯源/清洗/纠正/预演/标签/事件流）
 tests/test_investigations.py # 19 个调查封存端到端测试（传播/截断/叠加/约束/事件/乱序补登）
+tests/test_code_merges.py    # 22 个并码端到端测试（校验/串接/合并去重/原值保留/事件/预演互斥/兼容）
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 examples/demo_investigations.sh  # 调查封存专项 curl 演示
+examples/demo_code_merges.sh     # 过敏原代码并码专项 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

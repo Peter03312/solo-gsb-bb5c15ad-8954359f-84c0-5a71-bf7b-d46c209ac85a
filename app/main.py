@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .schemas import (
     CleaningCreate,
+    CodeMergeCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
     InvestigationCreate,
@@ -29,11 +30,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.4.0",
+    version="1.5.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
                 "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存，"
-                "以及面向下游的游标增量变更事件订阅。",
+                "过敏原代码并码（同义代码串接到规范代码、实时溯源合并去重并保留"
+                "原始来源），以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
 
@@ -175,6 +177,38 @@ def commit_preview(preview_id: str, conn=Depends(get_conn)):
     """凭预演凭据原子应用变更：影响本次差异的记录已变化则 409（需重新预演），
     无关记录更新不使凭据失效。返回实际影响（与预演同口径）。"""
     return service.commit_preview(conn, preview_id)
+
+
+# ---------------------------------------------------------------- 过敏原代码并码
+
+@app.post("/allergen-codes/merges", status_code=201, tags=["过敏原并码"])
+def register_code_merge(data: CodeMergeCreate, conn=Depends(get_conn)):
+    """登记过敏原代码并码（旧代码 -> 规范代码，必填原因）。
+
+    目标代码必须当前不是别名；自映射、成环、把同一旧代码改指其他目标一律
+    拒绝且不留记录；同向重试幂等返回原结果（不新增记录、不产事件）。并码
+    与受影响批次的重算事件在同一事务原子提交，已签发标签快照不变。
+    """
+    return service.register_code_merge(conn, data)
+
+
+@app.get("/allergen-codes/merges", tags=["过敏原并码"])
+def list_code_merges(conn=Depends(get_conn)):
+    """列出全部并码登记（含最终规范代码与沿革）。"""
+    return service.list_code_merges(conn)
+
+
+@app.get("/allergen-codes/merges/{old_code}", tags=["过敏原并码"])
+def get_code_merge(old_code: str, conn=Depends(get_conn)):
+    """按旧代码查询单条并码登记（含最终规范代码与沿革）。"""
+    return service.get_code_merge(conn, old_code)
+
+
+@app.get("/allergen-codes/{code}/resolve", tags=["过敏原并码"])
+def resolve_allergen_code(code: str, conn=Depends(get_conn)):
+    """查询过敏原代码的最终规范代码：返回 canonical_code、是否别名及并码沿革；
+    未见于任何原料声明版本或并码关系的代码返回 404。"""
+    return service.resolve_code(conn, code)
 
 
 # ---------------------------------------------------------------- 溯源查询

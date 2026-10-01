@@ -96,6 +96,22 @@ class InvestigationCreate(BaseModel):
         return v
 
 
+class CodeMergeCreate(BaseModel):
+    """过敏原代码并码登记：把旧代码 old_code 并到规范代码 target_code（必填原因）。"""
+
+    old_code: str = Field(min_length=1)
+    target_code: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+    @field_validator("old_code", "target_code", "reason")
+    @classmethod
+    def _v_nonblank(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+
 # 声明更正预演请求与正式更正同构；清洗撤销预演/凭据提交无请求体，
 # 仅以路径参数（清洗 id / 预演凭据）定位。
 class DeclarationPreviewCreate(DeclarationCreate):
