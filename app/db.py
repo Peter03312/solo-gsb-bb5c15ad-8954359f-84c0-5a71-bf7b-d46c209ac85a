@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS investigations (
     status      TEXT NOT NULL DEFAULT 'open'
 );
 
+-- 过敏原代码并码（同义代码合并）：质控登记 old_code -> target_code，每个旧代码
+-- 只能登记一次（UNIQUE 强约束：同一旧代码改指其他目标在库层即被拒绝）；
+-- target_code 后续自身也可被并码（串接），解析时沿链到最终规范代码。
+-- 原料声明版本与标签快照中的原始代码永不改写出库，只在实时计算时按本表规范化。
+CREATE TABLE IF NOT EXISTS allergen_code_merges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_code    TEXT NOT NULL UNIQUE,
+    target_code TEXT NOT NULL,
+    reason      TEXT NOT NULL,          -- 必填并码原因
+    merged_at   TEXT NOT NULL
+);
+
 -- 变更事件流：与业务写入同一事务落库，下游按游标（seq）增量消费。
 -- seq 全局递增；同一次操作产生的多条事件按批次号排序（插入序即批次号序）。
 CREATE TABLE IF NOT EXISTS trace_events (

@@ -23,7 +23,7 @@ def client():
     conn = db.connect()
     for t in ["material_declarations", "material_batches", "processing_inputs",
               "processing_outputs", "processings", "cleanings", "labels",
-              "trace_events", "investigations"]:
+              "trace_events", "investigations", "allergen_code_merges"]:
         conn.execute(f"DELETE FROM {t}")
     conn.execute("DELETE FROM sqlite_sequence WHERE name = 'trace_events'")
     conn.close()

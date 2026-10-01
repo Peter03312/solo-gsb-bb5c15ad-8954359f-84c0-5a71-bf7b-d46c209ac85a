@@ -28,6 +28,15 @@
   作为新加工投入**；若设备残留会使新加工产出受封存影响，加工登记同样拒绝，失败不留
   加工或标签。投入纠正、清洗登记/撤销、调查登记/解除后同步重算封存状态，
   并沿用游标事件流发布实际变化；旧标签快照不变，既有溯源结论字段保持兼容。
+- **过敏原代码并码**：质控以“旧代码 + 目标代码 + 必填原因”登记同义代码合并，
+  并码**可串接**；查询代码返回最终规范代码与沿革。目标须非空且当前不是别名，
+  自映射/成环/同一旧代码改指其他目标一律**拒绝且不留记录**，同向重试幂等返回
+  原结果。原料声明版本与已签发标签快照**保留原始代码**；实时溯源按最终规范
+  代码**合并同义项并去重**，同时保留每条原始来源路径、声明版本，待确认状态
+  不变。并码后重算受影响批次（含设备残留下游），沿用既有事件字段与全局顺序，
+  仅为实际变化记录事件；并码与事件同事务，与并发声明更正不产生混合状态。
+  新原料登记、声明更正与预演均按当前并码关系解释代码，既有接口字段与路径
+  结构保持兼容。
 
 ## 快速启动
 
@@ -82,6 +91,12 @@ pytest tests/ -q
   则上一次加工产出的全部过敏原/待确认状态作为残留继承。
 - **标签**：签发时将结论（每项过敏原/待确认的来源路径）与依据
   （命中的原料声明版本、赖以清除残留的清洗记录）整体冻结为快照，永不可变。
+- **过敏原代码并码**：`allergen_code_merges` 记录 `旧代码 -> 目标代码`（必填
+  原因），每个旧代码唯一；目标自身可再被并码形成串接链。登记与读取**不改写**
+  任何已存储的声明版本或标签快照；实时溯源时沿链把声明代码解析到最终规范代码，
+  同义项合并、按完整路径去重，仅在该代码确为别名时于声明步骤附加
+  `allergen_code`（原始代码）/ `canonical_code`（规范代码），无并码时步骤
+  结构与历史完全一致。
 
 ## API 一览
 
@@ -108,13 +123,17 @@ pytest tests/ -q
 | GET | `/batches/{batch_id}/labels` / `/labels/{id}` | 查询标签 |
 | GET | `/changes/snapshot` | 初始化读取：同一状态下的现存批次实时结论 + 游标 |
 | GET | `/changes/events` | 按游标分页读取变更事件（固定上界，无效游标拒绝） |
+| POST | `/allergen-merges` | 登记过敏原代码并码（旧代码 + 目标代码 + 必填原因；同向重试幂等） |
+| GET | `/allergen-merges` | 列出全部并码登记（按登记顺序） |
+| GET | `/allergen-codes/{code}` | 查询代码：最终规范代码 `canonical_code` 与并码沿革 `history` |
 
 错误约定：`400` 无效时序/参数（如投入批次在加工开始前不可用、无效游标、
-登记调查时批次未知、非法 `status` 过滤）；
+登记调查时批次未知、非法 `status` 过滤、并码旧代码未在任何现存声明中出现）；
 `404` 资源不存在；`409` 冲突（设备时间重叠、来源环、批次号占用、重复撤销、
 重复调查号、重复解除、对封存批次签发标签或以封存批次/受封存残留登记新加工、
-预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演）；
-`422` 请求格式错误（如时间缺少时区、调查字段为空白）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
+预演凭据不存在/已使用/已过期，或影响差异的记录已变化需重新预演；并码自映射、
+目标当前为别名、同一旧代码改指其他目标）；
+`422` 请求格式错误（如时间缺少时区、调查字段为空白、并码原因为空白）。所有时间必须为带时区的 ISO8601（建议 UTC `Z`）。
 
 ## 变更预演（dry-run）与凭据提交
 
@@ -236,7 +255,10 @@ curl -s $BASE/batches/OUT-OAT-1/trace
   `processing_register`（加工登记）、`processing_input_correction`（加工投入纠正，
   `op_ref` 为 `{"processing_id": ...}`）、`cleaning_register`（清洗登记）、
   `cleaning_revocation`（清洗撤销，含预演提交）、`investigation_open`
-  （调查封存登记）、`investigation_lift`（调查封存解除）。
+  （调查封存登记）、`investigation_lift`（调查封存解除）、
+  `allergen_code_merge`（过敏原代码并码，
+  `op_ref` 为 `{"merge_id", "old_code", "target_code"}`；事件 after 中过敏原
+  按最终规范代码合并、路径步骤保留原始代码）。
   封存类事件的视图在既有 `conclusion`/`basis` 外新增 `release` 字段
   （`held` + 生效调查及传播路径）；旧字段结构不变，事件重放与快照保持兼容。
 - **新批次**（原料登记、加工产出）`before` 为 `null`（前态为空）。
@@ -332,6 +354,74 @@ curl -s $BASE/batches/OUT-OAT-1/labels -X POST \
 curl -s $BASE/labels/1   # 旧标签保持签发时的结论不变
 ```
 
+## 过敏原代码并码（同义代码合并）
+
+质控发现声明中沿用了**旧过敏原代码**时，以“旧代码 + 目标代码 + 必填原因”
+登记并码：
+
+```
+POST /allergen-merges
+{"old_code": "casein", "target_code": "milk", "reason": "供应商代码勘误：酪蛋白并入 milk"}
+```
+
+规则：
+
+- **登记校验（校验与写入同一 `BEGIN IMMEDIATE` 事务，失败回滚不留任何记录或
+  事件）**：
+  - 旧代码、目标代码、原因均非空（空白 `422`）；旧代码与目标代码相同的
+    **自映射** `409`；
+  - **目标代码当前不能是别名**（即不能已存在以其为旧代码的并码，`409`）。
+    要串接时以当前规范代码为目标（先 `casein -> dairy` 再 `dairy -> milk`），
+    因此并码只能“接长”规范代码，链上不可能成环；
+  - 旧代码须在**现存原料声明（含历史版本）**中出现，否则 `400`；
+  - 每个旧代码只能并码一次（库层 UNIQUE）：**改指其他目标** `409` 拒绝；
+  - **同向重试**（`old_code/target_code` 完全相同，原因可不同）幂等返回原登记，
+    HTTP `200`、响应附 `"replayed": true`，不重复写、不产事件；新登记返回 `201`。
+- **串接与查询**：`GET /allergen-codes/{code}` 返回
+  `canonical_code`（沿链解析到的最终规范代码）、`is_alias` 与 `history`
+  （串接链上每一跳的 `merge_id/old_code/target_code/reason/merged_at`）；
+  未知代码以其自身为规范代码、沿革为空。`GET /allergen-merges` 列出全部登记。
+- **历史不改写**：原料声明各版本与已签发标签快照中的原始代码**原样保留**
+  （`GET /materials` 的 `allergens` 与标签 `conclusion` 不变；`allergens`
+  之外附加 `allergens_canonical` 给出当前规范代码）。
+- **实时溯源**：`/batches/{id}/trace`、事件视图与初始化快照按最终规范代码
+  **合并同义项**（多个旧代码归到同一过敏原键）并**按完整路径去重**；
+  每条来源路径仍逐步保留，别名声明步骤附 `allergen_code`/`canonical_code`
+  （规范代码自身与无并码场景步骤结构不变），依据中的声明版本号不变；
+  **待确认状态与代码无关，不受并码影响**；封存传播同样与代码无关、不变。
+- **重算与事件**：并码后全量重算受影响批次（含沿同设备后续加工的
+  **设备残留下游**），沿用既有事件字段与全局递增序号：`op` =
+  `allergen_code_merge`，`op_ref` = `{"merge_id", "old_code", "target_code"}`，
+  **仅结论/路径/依据实际变化的批次按批次号顺序**落事件；与并码无关的过敏原
+  （步骤逐字节未变）不产事件；校验失败、幂等重试不产事件。
+- **并发与预演**：并码登记与事件在同一事务原子提交（`BEGIN IMMEDIATE`
+  串行化并发写）；预演凭据指纹纳入当前并码关系整体，预演期间任何并码登记
+  都会使凭据失效（提交 `409` 需重新预演），杜绝并码与声明更正并发提交出现
+  混合状态。
+- **新登记/更正按当前关系解释**：并码后登记新原料、追加声明更正、声明更正
+  预演中的过敏原代码均按当前并码关系解析（存储原始代码，实时出规范代码）。
+- 既有接口的字段与路径结构保持兼容：变更仅为**新增键**（`allergens_canonical`、
+  别名步骤上的两个代码字段、并码接口本身），无并码时所有响应与历史一致。
+
+```bash
+BASE=http://localhost:8000
+
+# 登记并码（必填原因）；可串接
+curl -s $BASE/allergen-merges -X POST -H 'Content-Type: application/json' \
+  -d '{"old_code":"casein","target_code":"dairy","reason":"供应商代码勘误"}'
+curl -s $BASE/allergen-merges -X POST -H 'Content-Type: application/json' \
+  -d '{"old_code":"dairy","target_code":"milk","reason":"标准代码统一"}'
+
+# 查询最终规范代码与并码沿革
+curl -s $BASE/allergen-codes/casein   # -> canonical_code=milk, history 两跳
+curl -s $BASE/allergen-merges
+
+# 实时溯源：同义项合并为 milk 并去重，路径步骤保留 allergen_code/canonical_code
+curl -s $BASE/batches/OUT-9/trace
+```
+
+完整专项演示脚本：`./examples/demo_merges.sh`
+
 ## 调查封存（疑似交叉接触）
 
 质控人员发现疑似交叉接触时，以**批次号、唯一调查号、原因**登记调查：
@@ -401,12 +491,14 @@ curl -s $BASE/investigations/INV-2026-001/lift -X POST
 ```
 app/
   main.py      # FastAPI 路由与错误映射
-  service.py   # 业务规则：校验、溯源计算、调查封存传播、标签签发、变更预演、变更事件流
+  service.py   # 业务规则：校验、溯源计算、代码并码规范化、调查封存传播、标签签发、变更预演、变更事件流
   db.py        # SQLite 连接、建表、写/读事务
   schemas.py   # 请求模型（强制时区感知时间）
 tests/test_app.py            # 45 个端到端测试（溯源/清洗/纠正/预演/标签/事件流）
 tests/test_investigations.py # 19 个调查封存端到端测试（传播/截断/叠加/约束/事件/乱序补登）
+tests/test_allergen_merges.py # 19 个并码端到端测试（校验/幂等/串接/规范化/去重/快照/事件/并发）
 examples/demo.sh    # 全流程 curl 演示（含变更订阅）
 examples/demo_investigations.sh  # 调查封存专项 curl 演示
+examples/demo_merges.sh          # 过敏原代码并码专项 curl 演示
 Dockerfile / docker-compose.yml / requirements*.txt
 ```

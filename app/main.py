@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from . import db, service
 from .schemas import (
+    AllergenCodeMergeCreate,
     CleaningCreate,
     DeclarationCreate,
     DeclarationPreviewCreate,
@@ -29,10 +30,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="过敏原溯源服务",
-    version="1.4.0",
+    version="1.5.0",
     description="共线生产食品批次的过敏原与待确认状态溯源：原料声明、加工登记、"
                 "加工投入纠正、设备残留与清洗、来源路径查询、标签签发，"
-                "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存，"
+                "声明更正/清洗撤销的预演与凭据提交、疑似交叉接触的调查封存、"
+                "过敏原代码并码（旧代码并入目标代码、可串接、实时规范化），"
                 "以及面向下游的游标增量变更事件订阅。",
     lifespan=lifespan,
 )
@@ -98,6 +100,39 @@ def preview_declaration(batch_id: str, data: DeclarationPreviewCreate,
     """声明更正预演（不落库）：返回确有差异的下游批次（过敏原/待确认/来源路径/依据）
     及其已签发标签相对变更前后实时结论的差异，并给出提交凭据。"""
     return service.preview_declaration(conn, batch_id, data)
+
+
+# ---------------------------------------------------------------- 过敏原代码并码
+
+@app.post("/allergen-merges", status_code=201, tags=["过敏原代码并码"])
+def create_allergen_merge(data: AllergenCodeMergeCreate,
+                          conn=Depends(get_conn)):
+    """登记过敏原代码并码（旧代码 -> 目标代码，必填原因）。
+
+    旧代码须在现存原料声明中出现；目标代码非空且当前不能是别名；自映射、
+    成环、同一旧代码改指其他目标一律拒绝（校验与写入同一事务，失败不留
+    任何记录或事件）。完全相同的并码请求视为同向重试，幂等返回原登记
+    （200，不重复写、不产事件）；新登记返回 201。并码可串接；并码后实时
+    溯源按最终规范代码合并同义项并去重，原料声明版本与标签快照保留原值。
+    """
+    view, replayed = service.register_allergen_merge(conn, data)
+    body = {**view, "replayed": replayed}
+    if replayed:  # 同向重试：返回原结果，状态码 200
+        return JSONResponse(status_code=200, content=body)
+    return body
+
+
+@app.get("/allergen-merges", tags=["过敏原代码并码"])
+def get_allergen_merges(conn=Depends(get_conn)):
+    """列出全部过敏原代码并码登记（按登记顺序，含串接链上的每一跳）。"""
+    return {"merges": service.list_allergen_merges(conn)}
+
+
+@app.get("/allergen-codes/{code}", tags=["过敏原代码并码"])
+def get_allergen_code(code: str, conn=Depends(get_conn)):
+    """查询过敏原代码：返回最终规范代码 canonical_code 与并码沿革 history
+    （串接链上的每一跳；未知代码其自身即规范代码，history 为空）。"""
+    return service.allergen_code_info(conn, code)
 
 
 # ---------------------------------------------------------------- 加工批次

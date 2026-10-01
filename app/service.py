@@ -56,6 +56,143 @@ def iso_z(s: str) -> str:
     return s.replace("+00:00", "Z")
 
 
+# ---------------------------------------------------------------- 过敏原代码并码
+#
+# 质控登记的“旧过敏原代码 -> 目标代码”并码关系可串接（目标自身也可再被并码）。
+# 原料声明各版本与已签发标签快照中的原始代码**永不改写出库**；实时溯源时沿并码
+# 链把每条声明代码解析到**最终规范代码**：同义项合并为同一过敏原并按完整路径
+# 去重，每个声明步骤仍保留原始来源代码（allergen_code）与解析结果
+# （canonical_code），声明版本依据不变。并码登记与事件同事务原子提交。
+
+def _allergen_merge_map(conn: sqlite3.Connection) -> dict[str, str]:
+    """当前并码关系：{old_code: target_code}（每个旧代码至多一条）。"""
+    return {r["old_code"]: r["target_code"]
+            for r in conn.execute(
+                "SELECT old_code, target_code FROM allergen_code_merges")}
+
+
+def resolve_canonical(merge_map: dict[str, str], code: str) -> str:
+    """沿并码链解析最终规范代码（登记校验保证链无环，兜底防死循环）。"""
+    cur, seen = code, set()
+    while cur in merge_map:
+        if cur in seen:
+            raise Conflict(f"过敏原代码并码链存在环: {code}")
+        seen.add(cur)
+        cur = merge_map[cur]
+    return cur
+
+
+def _merge_chain(conn: sqlite3.Connection, code: str) -> list[dict]:
+    """从 code 起沿并码链返回每一跳登记记录（空链 = 自身即规范代码）。"""
+    chain, cur, seen = [], code, set()
+    while True:
+        row = conn.execute(
+            "SELECT * FROM allergen_code_merges WHERE old_code = ?",
+            (cur,)).fetchone()
+        if not row:
+            break
+        if cur in seen:
+            raise Conflict(f"过敏原代码并码链存在环: {code}")
+        seen.add(cur)
+        chain.append(_merge_view(row))
+        cur = row["target_code"]
+    return chain
+
+
+def _merge_view(row) -> dict:
+    return {
+        "merge_id": row["id"],
+        "old_code": row["old_code"],
+        "target_code": row["target_code"],
+        "reason": row["reason"],
+        "merged_at": iso_z(row["merged_at"]),
+    }
+
+
+def _declared_allergen_codes(conn: sqlite3.Connection) -> set[str]:
+    """现存原料声明（含历史版本）中出现过的全部原始过敏原代码。"""
+    known: set[str] = set()
+    for r in conn.execute("SELECT allergens FROM material_declarations"):
+        known.update(json.loads(r["allergens"]))
+    return known
+
+
+def register_allergen_merge(conn: sqlite3.Connection, data):
+    """登记过敏原代码并码（旧代码 -> 目标代码，必填原因）。
+
+    校验（全部在 BEGIN IMMEDIATE 事务内，失败回滚不留任何记录/事件）：
+    - 旧代码与目标代码均非空（请求层 422），且不得自映射；
+    - 旧代码须在现存原料声明（含历史版本）中出现；
+    - 目标代码当前不能是别名（即不能已存在以其为旧代码的并码），因此并码
+      只可能“接长”规范代码、链上不可能成环；
+    - 同一旧代码只能并码一次：改指其他目标 409 拒绝；完全相同的并码请求
+      视为同向重试，幂等返回原登记（200，不重复写、不产事件）。
+    成功后按最终规范代码实时重算全部批次（含设备残留下游），仅为实际变化
+    的批次按批次号顺序沿用既有事件字段记录 op=allergen_code_merge 事件。
+    返回 (merge_view, replayed)。
+    """
+    old, target = data.old_code, data.target_code
+    with write_tx(conn):
+        if old == target:
+            raise Conflict(
+                f"自映射拒绝：旧代码与目标代码相同（{old}）")
+        existing = conn.execute(
+            "SELECT * FROM allergen_code_merges WHERE old_code = ?",
+            (old,)).fetchone()
+        if existing:
+            if existing["target_code"] == target:
+                return _merge_view(existing), True  # 同向重试：返回原结果
+            raise Conflict(
+                f"旧代码 {old} 已并入 {existing['target_code']}，"
+                f"不能改指其他目标 {target}")
+        merge_map = _allergen_merge_map(conn)
+        if target in merge_map:
+            raise Conflict(
+                f"目标代码 {target} 当前是别名（已并入 {merge_map[target]}），"
+                "不能作为并码目标；如需串接请以当前规范代码为目标")
+        if old not in _declared_allergen_codes(conn):
+            raise BadRequest(
+                f"旧过敏原代码 {old} 未在任何现存原料声明中出现，不能并码")
+
+        releases = _all_releases(conn)
+        before_views = _snapshot_views(conn, releases)
+        merged_at = to_store(now_utc())
+        cur = conn.execute(
+            "INSERT INTO allergen_code_merges (old_code, target_code, reason, merged_at)"
+            " VALUES (?, ?, ?, ?)",
+            (old, target, data.reason, merged_at))
+        merge_id = cur.lastrowid
+        # 写入后全量前后对比：并码只改过敏原代码的规范呈现，待确认/封存状态
+        # 与代码无关，仅结论/路径/依据实际变化的批次落事件。
+        _record_events(conn, "allergen_code_merge",
+                       {"merge_id": merge_id, "old_code": old,
+                        "target_code": target}, before_views,
+                       before_releases=releases)
+        row = conn.execute(
+            "SELECT * FROM allergen_code_merges WHERE id = ?",
+            (merge_id,)).fetchone()
+        view = _merge_view(row)
+    return view, False
+
+
+def list_allergen_merges(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM allergen_code_merges ORDER BY id").fetchall()
+    return [_merge_view(r) for r in rows]
+
+
+def allergen_code_info(conn: sqlite3.Connection, code: str) -> dict:
+    """查询过敏原代码：返回最终规范代码与并码沿革（未知代码其自身即规范代码）。"""
+    history = _merge_chain(conn, code)
+    canonical = history[-1]["target_code"] if history else code
+    return {
+        "code": code,
+        "canonical_code": canonical,
+        "is_alias": bool(history),
+        "history": history,
+    }
+
+
 # ---------------------------------------------------------------- 批次查询
 
 def _material(conn, batch_id: str):
@@ -153,17 +290,22 @@ def get_material(conn: sqlite3.Connection, batch_id: str) -> dict:
     if not m:
         raise NotFound(f"未知原料批次: {batch_id}")
     decl = _current_declaration(conn, batch_id)
-    history = conn.execute(
+    history_n = conn.execute(
         "SELECT COUNT(*) AS n FROM material_declarations WHERE batch_id = ?", (batch_id,)
     ).fetchone()["n"]
+    merge_map = _allergen_merge_map(conn)
+    raw_allergens = json.loads(decl["allergens"])
     return {
         "batch_id": batch_id,
         "kind": "material",
-        "allergens": json.loads(decl["allergens"]),
+        "allergens": raw_allergens,
+        # 新增（附加字段，原始 allergens 保留）：按当前并码关系解析的规范代码
+        "allergens_canonical": sorted(
+            {resolve_canonical(merge_map, a) for a in raw_allergens}),
         "pending": bool(decl["pending"]),
         "version": decl["version"],
         "declared_at": iso_z(decl["declared_at"]),
-        "declaration_versions": history,
+        "declaration_versions": history_n,
     }
 
 
@@ -644,27 +786,51 @@ def _residue_held_output(conn: sqlite3.Connection, equipment_id: str,
 
 # ---------------------------------------------------------------- 溯源计算
 
+def _dedup_paths(paths: list[list[dict]]) -> list[list[dict]]:
+    """按完整路径（逐步内容）去重，保留首次出现顺序。
+
+    并码后不同原始代码会并入同一规范过敏原：来自不同声明步骤的路径是
+    不同证据（声明步骤带 allergen_code/canonical_code），保留；完全相同的
+    路径只计一条。
+    """
+    seen, out = set(), []
+    for p in paths:
+        key = json.dumps(p, ensure_ascii=False, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 def compute_trace(conn: sqlite3.Connection, batch_id: str,
                   decl_overrides: dict | None = None,
                   extra_revoked_cleanings: set | None = None):
     """按当前有效记录实时计算批次结论。
 
+    过敏原代码按**当前并码关系**解释（见 allergen_code_merges）：每条声明代码
+    解析到最终规范代码，同义旧代码合并为同一过敏原并按完整路径去重；声明步骤
+    同时保留原始代码（allergen_code）与规范代码（canonical_code），原料声明
+    版本与依据口径不变——并码不改写任何已存储的声明或标签快照。
+
     decl_overrides: {batch_id: {"allergens": [...], "pending": bool,
                                 "version": int, "declared_at": str}}
-        预演用：用“拟更正后的新版本声明”覆盖该原料的当前有效声明（不落库）。
+        预演用：用“拟更正后的新版本声明”覆盖该原料的当前有效声明（不落库）；
+        覆盖中的原始代码同样按当前并码关系解释。
     extra_revoked_cleanings: set[int]
         预演用：把这些清洗记录视为已撤销（不落库）。
 
     返回 (result, evidence)：
-    - result: {"allergens": {过敏原: [路径...]}, "pending_paths": [路径...]}
+    - result: {"allergens": {规范过敏原: [路径...]}, "pending_paths": [路径...]}
     - evidence: 计算依据（命中的原料声明版本、赖以清除残留的清洗记录）
     路径 = 步骤列表，步骤形如：
-      {"batch_id": "RM-1", "via": "declaration"}
+      {"batch_id": "RM-1", "via": "declaration",
+       "allergen_code": "milk_old", "canonical_code": "milk"}
       {"batch_id": "OUT-1", "processing_id": "P1", "via": "input"}
       {"batch_id": "OUT-2", "processing_id": "P2", "via": "equipment_residue", "equipment_id": "EQ-1"}
     """
     decl_overrides = decl_overrides or {}
     extra_revoked_cleanings = extra_revoked_cleanings or set()
+    merge_map = _allergen_merge_map(conn)
     evidence = {"materials": {}, "cleanings": {}}
     memo: dict[str, dict] = {}
 
@@ -688,14 +854,25 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str,
                 "batch_id": bid,
                 "version": version,
                 "allergens": allergens,
+                "allergens_canonical": sorted(
+                    {resolve_canonical(merge_map, a) for a in allergens}),
                 "pending": bool(pending),
                 "declared_at": iso_z(declared_at),
             }
-            step = {"batch_id": bid, "via": "declaration"}
-            res = {
-                "allergens": {a: [[step]] for a in allergens},
-                "pending_paths": [[step]] if pending else [],
-            }
+            res = {"allergens": {}, "pending_paths": []}
+            if pending:
+                res["pending_paths"].append(
+                    [{"batch_id": bid, "via": "declaration"}])
+            # 按最终规范代码合并同义项。仅当该原始代码确为别名（规范结果
+            # 不同）时才在声明步骤上附加 allergen_code/canonical_code：
+            # 与并码无关的过敏原步骤逐字节保持原样，不会产生伪变化事件。
+            for raw in allergens:
+                canonical = resolve_canonical(merge_map, raw)
+                step = {"batch_id": bid, "via": "declaration"}
+                if canonical != raw:
+                    step["allergen_code"] = raw
+                    step["canonical_code"] = canonical
+                res["allergens"].setdefault(canonical, []).append([step])
         else:
             out = _output_of(conn, bid)
             if not out:
@@ -755,6 +932,12 @@ def compute_trace(conn: sqlite3.Connection, batch_id: str,
         return res
 
     result = trace(batch_id)
+    # 并码合并同义项后按完整路径去重（不同原始声明代码的路径步骤不同，保留）
+    result = {
+        "allergens": {a: _dedup_paths(paths)
+                      for a, paths in result["allergens"].items()},
+        "pending_paths": _dedup_paths(result["pending_paths"]),
+    }
     return result, evidence
 
 
@@ -1047,8 +1230,13 @@ def _canon_conclusion(c: dict) -> dict:
 def _canon_basis(b: dict) -> dict:
     return {
         "material_declarations": {
-            d["batch_id"]: {"version": d["version"], "allergens": sorted(d["allergens"]),
-                            "pending": bool(d["pending"]), "declared_at": d["declared_at"]}
+            d["batch_id"]: {"version": d["version"],
+                            "allergens": sorted(d["allergens"]),
+                            "allergens_canonical": sorted(
+                                d.get("allergens_canonical",
+                                      d["allergens"])),
+                            "pending": bool(d["pending"]),
+                            "declared_at": d["declared_at"]}
             for d in b.get("material_declarations", [])},
         "cleanings": {d["id"]: {"equipment_id": d["equipment_id"],
                                 "cleaned_at": d["cleaned_at"]}
@@ -1230,6 +1418,14 @@ def _collect_witnesses(conn: sqlite3.Connection, affected: dict,
         "cleanings": {},
         "labels": {str(i): labels[i] for i in sorted(labels)},
         "investigations": {},
+        # 当前并码关系整体纳入指纹：预演期间任何并码登记（即使发生在无关
+        # 原料链上）都改变“代码解释口径”，凭据必须失效、要求重新预演，
+        # 杜绝并码与声明更正并发提交产生混合状态。
+        "allergen_code_merges": [
+            {"old_code": r["old_code"], "target_code": r["target_code"]}
+            for r in conn.execute(
+                "SELECT old_code, target_code FROM allergen_code_merges"
+                " ORDER BY id")],
     }
 
     for bid in sorted(materials):
